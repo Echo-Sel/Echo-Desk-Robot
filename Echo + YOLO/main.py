@@ -35,7 +35,12 @@ MIC_INDEX = None
 TRIGGER_WORD = "echo"
 CONVERSATION_TIMEOUT = 30  # seconds of inactivity before exiting conversation mode
 
-logging.basicConfig(level=logging.INFO)  # logging
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+
+# Suppress ALSA warnings (from PyAudio) is hard in python, but we can set energy threshold manually
+TRIG_WORD = "echo" # normalized
+  # logging
 
 
 recognizer = sr.Recognizer()
@@ -110,7 +115,7 @@ executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 # TTS setup
 def speak_text(text: str):
     try:
-        subprocess.run(["say", "-v", "Ava", text])
+        subprocess.run(["espeak", text])
     except Exception as e:
         logging.error(f"❌ TTS failed: {e}")
 
@@ -297,19 +302,20 @@ face_tools = FaceRecognitionTools(vision)
 vision.start()
 
 # Verify Camera
-if vision.check_camera():
-    logging.info("✅ Camera verification successful.")
-    # vision.start() # Already called after face_tools instantiation
-else:
-    logging.error("❌ Camera verification failed.")
-    # We can't speak here easily because 'speak_text' is defined above but designed to be used; 
-    # we should use it to notify user.
-    # Note: speak_text is defined at line 80.
-    # We will invoke it.
-    try:
-        subprocess.run(["say", "-v", "Ava", "Warning. Camera not detected. Vision capabilities are disabled."])
-    except:
-        pass
+# Temporarily skip camera verification - main loop will handle it
+# if vision.check_camera():
+#     logging.info("✅ Camera verification successful.")
+#     # vision.start() # Already called after face_tools instantiation
+# else:
+#     logging.error("❌ Camera verification failed.")
+#     # We can't speak here easily because 'speak_text' is defined above but designed to be used; 
+#     # we should use it to notify user.
+#     # Note: speak_text is defined at line 80.
+#     # We will invoke it.
+#     try:
+#         subprocess.run(["espeak", "Warning. Camera not detected. Vision capabilities are disabled."])
+#     except:
+#         pass
 
 # Initialize Agent Executor initially (default to Unknown)
 current_agent_user = None
@@ -362,7 +368,15 @@ def write():
     
     try:
         with mic as source:
-            recognizer.adjust_for_ambient_noise(source)
+            logging.info("🎤 Adjusting for ambient noise... Please wait.")
+            recognizer.adjust_for_ambient_noise(source, duration=2)
+            
+            # Manual threshold adjustment if auto is failing
+            # recognizer.energy_threshold = 300  # Uncomment if too insensitive
+            # recognizer.dynamic_energy_threshold = True
+            
+            logging.info(f"🔊 Energy threshold set to: {recognizer.energy_threshold}")
+            
             while True:
                 # 0. Check for User Change (Dynamic Profile Switching)
                 visible_person = shared_state.person_name
@@ -391,17 +405,21 @@ def write():
                 try:
                     if not conversation_mode:
                         logging.info("🎤 Listening for wake word...")
-                        audio = recognizer.listen(source, timeout=10)
+                        # Tune sensitivity - phrase_time_limit helps avoid stuck listening
+                        audio = recognizer.listen(source, timeout=10, phrase_time_limit=5)
+                        
+                        logging.info("🎧 Processing audio...")
                         transcript = recognizer.recognize_google(audio)
-                        logging.info(f"🗣 Heard: {transcript}")
+                        logging.info(f"🗣 Heard: '{transcript}'")
 
                         if TRIGGER_WORD.lower() in transcript.lower():
-                            logging.info(f"🗣 Triggered by: {transcript}")
+                            logging.info(f"✅ Wake word '{TRIGGER_WORD}' detected!")
                             speak_text("Yes sir?")
                             conversation_mode = True
                             last_interaction_time = time.time()
                         else:
-                            logging.debug("Wake word not detected, continuing...")
+                            logging.debug(f"Captured '{transcript}', waiting for '{TRIGGER_WORD}'...")
+
                     else:
                         logging.info("🎤 Listening for next command...")
                         audio = recognizer.listen(source, timeout=10)
@@ -503,6 +521,10 @@ def write():
                         conversation_mode = False
                 except sr.UnknownValueError:
                     logging.warning("⚠️ Could not understand audio.")
+                except sr.RequestError as e:
+                    logging.error(f"❌ Connection error: {e}")
+                    speak_text("I'm having trouble connecting to the internet. Please check my connection.")
+                    time.sleep(5) # Cooldown to avoid flooding
                 except Exception as e:
                     logging.error(f"❌ Error during recognition or tool call: {e}")
                     time.sleep(1)

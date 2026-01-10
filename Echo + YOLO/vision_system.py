@@ -10,6 +10,20 @@ from ultralytics import YOLO
 from shared.state import SharedState
 from object_tracker import ObjectTracker
 from vision_learning import ObjectLearner
+#test
+# Quick picamera2 test
+try:
+    from picamera2 import Picamera2
+    print("✅ picamera2 import SUCCESS")
+    PICAMERA_AVAILABLE = True
+    logging.info("✅ picamera2 module loaded")
+except ImportError as e:
+    print(f"❌ picamera2 import FAILED: {e}")
+    PICAMERA_AVAILABLE = False
+    logging.warning(f"⚠️ picamera2 not available: {e}")
+except Exception as e:
+    print(f"❌ picamera2 import FAILED (Unknown error): {e}")
+    PICAMERA_AVAILABLE = False
 
 class VisionSystem:
     def __init__(self, shared_state: SharedState, model_path="yolov8n.pt"):
@@ -102,24 +116,17 @@ class VisionSystem:
 
     def check_camera(self) -> bool:
         """
-        Verifies if the camera is accessible.
-        Returns: True if camera works, False otherwise.
+        Verifies if picamera2 is available.
+        Actual camera opening happens in _run_loop().
         """
-        logging.info("👁️ Checking camera connection...")
-        for i in range(5):
-             try:
-                cap = cv2.VideoCapture(i)
-                if cap.isOpened():
-                    ret, frame = cap.read()
-                    cap.release()
-                    if ret:
-                        logging.info(f"✅ Camera found at index {i}")
-                        return True
-             except:
-                 pass
-        
-        logging.error("❌ No working camera found (checked indices 0-4).")
-        return False
+        logging.info("👁️ Checking if picamera2 is available...")
+        try:
+            from picamera2 import Picamera2
+            logging.info("✅ picamera2 module available")
+            return True
+        except ImportError as e:
+            logging.error(f"❌ picamera2 not available: {e}")
+            return False
 
     def learn_current_object(self, name: str):
         """Triggers learning of the object currently in the center of the frame."""
@@ -132,9 +139,19 @@ class VisionSystem:
         self.running = False
         if self.thread:
             self.thread.join()
+        
+        # Stop picamera2 if using it
+        if hasattr(self, 'use_picamera') and self.use_picamera and hasattr(self, 'picam'):
+            try:
+                self.picam.stop()
+            except:
+                pass
+        
+        # Release OpenCV capture if using it
         if self.cap:
             self.cap.release()
-        logging.info("👁️ Vision System stopped.")
+        
+        logging.info("�️ Vision System stopped.")
 
     def _run_loop(self):
         logging.info(f"👁️ Loading YOLO model: {self.model_path}...")
@@ -145,35 +162,77 @@ class VisionSystem:
             self.running = False
             return
 
-        logging.info("👁️ Opening camera...")
+        logging.info("🎥 Opening camera...")
         self.cap = None
-        for i in range(5):
-             try:
-                 temp_cap = cv2.VideoCapture(i)
-                 if temp_cap.isOpened():
-                     self.cap = temp_cap
-                     logging.info(f"✅ Vision System using camera index {i}")
-                     break
-             except:
-                 continue
-                 
-        if not self.cap or not self.cap.isOpened():
-            logging.error("❌ Could not open any webcam (checked mismatch 0-4).")
-            self.running = False
-            return
+        self.use_picamera = False
+
+        # Try picamera2 first (for Arducam CSI camera)
+        try:
+            from picamera2 import Picamera2
+            self.picam = Picamera2()
+            config = self.picam.create_preview_configuration(
+                main={"size": (640, 480), "format": "RGB888"}
+            )
+            self.picam.configure(config)
+            self.picam.start()
             
-        # OPTIMIZATION: Set specific lightweight parameters for RPi
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
+            # Test capture
+            test_frame = self.picam.capture_array()
+            if test_frame is not None:
+                self.use_picamera = True
+                logging.info("✅ Vision System using Arducam via picamera2")
+            else:
+                self.picam.stop()
+                self.use_picamera = False
+        except Exception as e:
+            logging.debug(f"⚠️ picamera2 failed: {e}")
+            self.use_picamera = False
+
+        # Fallback to USB cameras if picamera2 failed
+        if not self.use_picamera:
+            for i in range(5):
+                try:
+                    temp_cap = cv2.VideoCapture(i)
+                    if temp_cap.isOpened():
+                        ret, test_frame = temp_cap.read()
+                        if ret and test_frame is not None:
+                            self.cap = temp_cap
+                            logging.info(f"✅ Vision System using USB camera index {i}")
+                            break
+                        else:
+                            temp_cap.release()
+                except:
+                    continue
+                    
+            if self.cap is None and not self.use_picamera:
+                logging.error("❌ Could not open any camera.")
+                self.running = False
+                return
+
+        # Set parameters (only for OpenCV capture)
+        if not self.use_picamera and self.cap:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
 
         # Frame skipping for performance (process every Nth frame)
         process_every_n_frames = 5
         frame_count = 0
 
         while self.running:
-            ret, frame = self.cap.read()
-            if not ret:
+            # Capture frame based on camera type
+            if self.use_picamera:
+                try:
+                    frame = self.picam.capture_array()
+                    ret = True
+                except Exception as e:
+                    logging.debug(f"⚠️ picamera2 capture failed: {e}")
+                    ret = False
+                    frame = None
+            else:
+                ret, frame = self.cap.read()
+                
+            if not ret or frame is None:
                 logging.debug("⚠️ Failed to grab frame.")
                 time.sleep(0.1)
                 continue
